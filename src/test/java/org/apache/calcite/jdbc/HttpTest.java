@@ -6,15 +6,19 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
-import java.util.Arrays;
+import java.sql.Statement;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
+import org.apache.calcite.avatica.jdbc.JdbcMeta;
 import org.apache.calcite.avatica.remote.Driver.Serialization;
 import org.apache.calcite.avatica.remote.LocalService;
 import org.apache.calcite.avatica.remote.Service;
 import org.apache.calcite.avatica.server.HttpServer;
 import org.apache.calcite.util.Sources;
+import org.apache.log4j.LogManager;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -29,14 +33,22 @@ public class HttpTest {
         // log levels
         ((Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME)).setLevel(Level.INFO);
         ((Logger) LoggerFactory.getLogger("org.apache.calcite")).setLevel(Level.INFO);
+        LogManager.getRootLogger().setLevel(org.apache.log4j.Level.INFO);
+        LogManager.getLogger("org.apache.calcite").setLevel(org.apache.log4j.Level.INFO);
     }
 
     HttpServer testServer;
 
     int port = 8080;
 
+    private AtomicInteger count = new AtomicInteger();
+
+    private AtomicInteger errors = new AtomicInteger();
+
+    private AtomicInteger rowsLoaded = new AtomicInteger();
+
     @Before
-    public void setUp() {
+    public void setUp() throws SQLException {
 
         HttpServer.Builder<?> avaticaServerBuilder = new HttpServer.Builder<>()
                 .withHandler(getLocalService(), Serialization.JSON)
@@ -58,23 +70,53 @@ public class HttpTest {
     public void testConcurrenClients() throws Exception {
         System.err.println("=== Test Run ===");
 
-        IntStream.range(0, 20).parallel().forEach(idx -> {
+        AtomicBoolean logOnce = new AtomicBoolean(true);
+
+        IntStream.range(0, 100).parallel().forEach(idx -> {
             try {
                 AvaticaTestClient testClient = new AvaticaTestClient("http://localhost:" + port);
-                Connection conn = testClient.getConnection();
+                Connection connection = testClient.getConnection();
 
-                conn.getMetaData().getTables(null, null, null, null);
-                for (String table : Arrays.asList("DEPTS", "EMPS", "SDEPTS")) {
-                    conn.createStatement().executeQuery("select * from " + table);
+                if (logOnce.getAndSet(false)) {
+                    output(connection.getMetaData().getTables(null, null, null, null));
                 }
 
-                conn.close();
+                try (ResultSet r = connection.getMetaData().getTables(null, null, null, null)) {
+                    while (r.next()) {
+                        String schema = r.getString(2);
+                        String table = r.getString(3);
+                        if (schema.equalsIgnoreCase("sales")) {
+
+                            Statement stmt = connection.createStatement();
+                            ResultSet rs = stmt.executeQuery("select * from " + schema + "." + table);
+                            ResultSetMetaData rsmd = rs.getMetaData();
+                            int cols = rsmd.getColumnCount();
+
+                            while (rs.next()) {
+                                for (int c = 1; c <= cols; c++) {
+                                    rs.getString(c);
+                                }
+                                rowsLoaded.incrementAndGet();
+                            }
+                            rs.close();
+                            stmt.close();
+                            count.incrementAndGet();
+
+                        }
+                    }
+                    System.err.print("*");
+                }
+
+                connection.close();
 
                 System.err.print("*");
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
         });
+
+        System.out.println("Tables loaded " + count + ", Errors: " + errors + ", Rows Total:" + rowsLoaded);
+
         System.err.println("\n-- DONE --");
     }
 
@@ -82,26 +124,12 @@ public class HttpTest {
         return Sources.of(HttpTest.class.getResource("/" + model + ".json")).file().getAbsolutePath();
     }
 
-    private Service getLocalService() {
+    private Service getLocalService() throws SQLException {
         Properties info = new Properties();
         info.put("model", jsonPath("model"));
 
-        Connection connection = null;
-        try {
-            connection = DriverManager.getConnection("jdbc:calcite:", info);
-            System.err.println("=== Server Setup ===");
-            output(connection.getMetaData().getTables(connection.getCatalog(), null, null, null));
-            return new LocalService(new CalciteMetaImpl((CalciteConnectionImpl) connection));
-        } catch (Exception e) {
-            if (connection != null) {
-                try {
-                    connection.close();
-                } catch (SQLException e1) {
-                    throw new RuntimeException(e1);
-                }
-            }
-            throw new RuntimeException(e);
-        }
+        System.err.println("=== Server Setup ===");
+        return new LocalService(new JdbcMeta("jdbc:calcite:", info));
     }
 
     private void output(ResultSet resultSet) throws SQLException {
